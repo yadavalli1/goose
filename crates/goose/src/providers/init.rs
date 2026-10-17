@@ -145,6 +145,9 @@ async fn init_registry() -> RwLock<ProviderRegistry> {
                     || config
                         .get_secret::<serde_json::Value>("LITELLM_API_KEY")
                         .is_ok()
+                    || config
+                        .get_param::<serde_json::Value>("LITELLM_OIDC_ISSUER_URL")
+                        .is_ok()
             })),
         );
         registry
@@ -222,6 +225,7 @@ async fn init_registry() -> RwLock<ProviderRegistry> {
         "huggingface",
         Arc::new(|| Box::pin(HuggingFaceProvider::cleanup())),
     );
+    registry.set_cleanup("litellm", Arc::new(|| Box::pin(LiteLLMProvider::cleanup())));
 
     if let Err(e) = load_custom_providers_into_registry(&mut registry) {
         tracing::warn!("Failed to load custom providers: {}", e);
@@ -579,6 +583,7 @@ mod tests {
         let _guard = env_lock::lock_env([
             ("LITELLM_API_KEY", None::<&str>),
             ("LITELLM_HOST", Some("http://localhost:4000")),
+            ("LITELLM_OIDC_ISSUER_URL", None::<&str>),
         ]);
 
         let entry = get_from_registry("litellm")
@@ -591,10 +596,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_litellm_configured_with_oidc_issuer_url() {
+        let _guard = env_lock::lock_env([
+            ("LITELLM_API_KEY", None::<&str>),
+            ("LITELLM_HOST", None::<&str>),
+            (
+                "LITELLM_OIDC_ISSUER_URL",
+                Some("https://idp.example.com/realms/goose"),
+            ),
+        ]);
+
+        let entry = get_from_registry("litellm")
+            .await
+            .expect("litellm should be registered");
+        assert!(
+            entry.inventory_configured(),
+            "litellm should be considered configured when LITELLM_OIDC_ISSUER_URL is set"
+        );
+    }
+
+    #[tokio::test]
     async fn test_litellm_not_configured_without_any_settings() {
         let _guard = env_lock::lock_env([
             ("LITELLM_API_KEY", None::<&str>),
             ("LITELLM_HOST", None::<&str>),
+            ("LITELLM_OIDC_ISSUER_URL", None::<&str>),
         ]);
 
         let entry = get_from_registry("litellm")

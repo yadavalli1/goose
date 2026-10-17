@@ -54,6 +54,7 @@ mod init;
 pub mod inventory;
 pub mod kimicode;
 pub mod litellm;
+pub mod litellm_oauth;
 #[cfg(feature = "local-inference")]
 pub mod local_inference;
 pub mod muse_code_def;

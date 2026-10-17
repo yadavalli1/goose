@@ -9,10 +9,13 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use super::api_client::{ApiClient, AuthMethod};
+use super::api_client::{ApiClient, AuthMethod, AuthProvider};
 use super::base::{
     ConfigKey, MessageStream, ModelInfo, Provider, ProviderDef, ProviderMetadata,
     DEFAULT_PROVIDER_TIMEOUT_SECS,
+};
+use super::litellm_oauth::{
+    cleanup_litellm_oauth_cache, LiteLLMOidcAuthProvider, LiteLLMOidcConfig,
 };
 use super::openai_compatible::{
     handle_response_openai_compat, handle_status, stream_openai_compat,
@@ -23,6 +26,7 @@ use crate::conversation::message::Message;
 use goose_providers::model::ModelConfig;
 use goose_providers::request_log::{start_log, LoggerHandleExt};
 use rmcp::model::Tool;
+use std::sync::Arc;
 
 const LITELLM_PROVIDER_NAME: &str = "litellm";
 const LITELLM_DEFAULT_HOST: &str = "http://localhost:4000";
@@ -38,7 +42,20 @@ enum CachedModelInfo {
     Failure(Instant),
 }
 
-#[derive(Debug, serde::Serialize)]
+struct SharedOidcAuthProvider(Arc<LiteLLMOidcAuthProvider>);
+
+#[async_trait]
+impl AuthProvider for SharedOidcAuthProvider {
+    async fn get_auth_header(&self) -> Result<(String, String)> {
+        self.0.get_auth_header().await
+    }
+
+    async fn refresh_credentials(&self) -> Result<()> {
+        self.0.refresh_credentials().await
+    }
+}
+
+#[derive(serde::Serialize)]
 pub struct LiteLLMProvider {
     #[serde(skip)]
     api_client: ApiClient,
@@ -48,9 +65,27 @@ pub struct LiteLLMProvider {
     name: String,
     #[serde(skip)]
     cached_model_info: tokio::sync::Mutex<Option<CachedModelInfo>>,
+    #[serde(skip)]
+    oidc_auth: Option<Arc<LiteLLMOidcAuthProvider>>,
+}
+
+impl std::fmt::Debug for LiteLLMProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiteLLMProvider")
+            .field("api_client", &self.api_client)
+            .field("base_path", &self.base_path)
+            .field("supports_streaming", &self.supports_streaming)
+            .field("name", &self.name)
+            .field("oidc_configured", &self.oidc_auth.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl LiteLLMProvider {
+    pub async fn cleanup() -> Result<()> {
+        cleanup_litellm_oauth_cache()
+    }
+
     pub async fn from_env(
         tls_config: Option<crate::providers::api_client::TlsConfig>,
     ) -> Result<Self> {
@@ -76,10 +111,18 @@ impl LiteLLMProvider {
             .get_param("LITELLM_SUPPORTS_STREAMING")
             .unwrap_or(true);
 
-        let auth = if api_key.is_empty() {
-            AuthMethod::NoAuth
-        } else {
+        let mut oidc_auth = None;
+        let auth = if !api_key.is_empty() {
             AuthMethod::BearerToken(api_key)
+        } else if let Some(oidc_config) = LiteLLMOidcConfig::from_config(config)? {
+            let provider = Arc::new(LiteLLMOidcAuthProvider::new(
+                oidc_config,
+                tls_config.clone(),
+            ));
+            oidc_auth = Some(Arc::clone(&provider));
+            AuthMethod::Custom(Box::new(SharedOidcAuthProvider(provider)))
+        } else {
+            AuthMethod::NoAuth
         };
 
         let mut api_client = ApiClient::with_timeout_and_tls(
@@ -106,6 +149,7 @@ impl LiteLLMProvider {
             supports_streaming,
             name: LITELLM_PROVIDER_NAME.to_string(),
             cached_model_info: tokio::sync::Mutex::new(None),
+            oidc_auth,
         })
     }
 
@@ -143,7 +187,13 @@ impl LiteLLMProvider {
     }
 
     async fn fetch_models_from_api(&self) -> Result<Vec<ModelInfo>, ProviderError> {
-        let response = self.api_client.request("model/info").response_get().await?;
+        let mut response = self.api_client.request("model/info").response_get().await?;
+
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED
+            && self.api_client.refresh_credentials().await.is_ok()
+        {
+            response = self.api_client.request("model/info").response_get().await?;
+        }
 
         if !response.status().is_success() {
             return Err(ProviderError::RequestFailed(format!(
@@ -213,12 +263,12 @@ impl goose_providers::base::ProviderDescriptor for LiteLLMProvider {
         ProviderMetadata::new(
             LITELLM_PROVIDER_NAME,
             "LiteLLM",
-            "LiteLLM proxy supporting multiple models with automatic prompt caching",
+            "LiteLLM proxy supporting multiple models with automatic prompt caching and OIDC JWT auth",
             LITELLM_DEFAULT_MODEL,
             vec![],
             LITELLM_DOC_URL,
             vec![
-                ConfigKey::new("LITELLM_API_KEY", true, true, None, true),
+                ConfigKey::new("LITELLM_API_KEY", false, true, None, true),
                 ConfigKey::new(
                     "LITELLM_HOST",
                     true,
@@ -240,6 +290,32 @@ impl goose_providers::base::ProviderDescriptor for LiteLLMProvider {
                     false,
                     false,
                     Some("true"),
+                    false,
+                ),
+                ConfigKey::new("LITELLM_OIDC_ISSUER_URL", false, false, None, false),
+                ConfigKey::new("LITELLM_OIDC_CLIENT_ID", false, false, None, false),
+                ConfigKey::new("LITELLM_OIDC_CLIENT_SECRET", false, true, None, false),
+                ConfigKey::new(
+                    "LITELLM_OIDC_SCOPES",
+                    false,
+                    false,
+                    Some("openid profile email offline_access"),
+                    false,
+                ),
+                ConfigKey::new("LITELLM_OIDC_AUDIENCE", false, false, None, false),
+                ConfigKey::new("LITELLM_OIDC_FLOW", false, false, Some("auto"), false),
+                ConfigKey::new(
+                    "LITELLM_OIDC_REDIRECT_URL",
+                    false,
+                    false,
+                    Some("http://localhost"),
+                    false,
+                ),
+                ConfigKey::new(
+                    "LITELLM_OIDC_TOKEN_TYPE",
+                    false,
+                    false,
+                    Some("access_token"),
                     false,
                 ),
             ],
@@ -281,6 +357,25 @@ impl ProviderDef for LiteLLMProvider {
 impl Provider for LiteLLMProvider {
     fn get_name(&self) -> &str {
         &self.name
+    }
+
+    async fn refresh_credentials(&self) -> Result<(), ProviderError> {
+        self.api_client
+            .refresh_credentials()
+            .await
+            .map_err(|error| ProviderError::Authentication(error.to_string()))
+    }
+
+    async fn configure_oauth(&self) -> Result<(), ProviderError> {
+        let Some(oidc_auth) = &self.oidc_auth else {
+            return Err(ProviderError::Authentication(
+                "LiteLLM OIDC is not configured. Set LITELLM_OIDC_ISSUER_URL and LITELLM_OIDC_CLIENT_ID.".to_string(),
+            ));
+        };
+        oidc_auth
+            .force_interactive_login()
+            .await
+            .map_err(|error| ProviderError::Authentication(error.to_string()))
     }
 
     async fn get_context_limit(&self, model: &str, override_limit: Option<usize>) -> usize {
@@ -461,6 +556,7 @@ mod tests {
             supports_streaming: true,
             name: LITELLM_PROVIDER_NAME.to_string(),
             cached_model_info: tokio::sync::Mutex::new(None),
+            oidc_auth: None,
         };
         let model = ModelConfig::new("litellm-streaming-log-test").with_prompt_cache_disabled();
 
@@ -531,6 +627,7 @@ mod tests {
             supports_streaming: false,
             name: LITELLM_PROVIDER_NAME.to_string(),
             cached_model_info: tokio::sync::Mutex::new(None),
+            oidc_auth: None,
         };
         let model = ModelConfig::new("litellm-json-log-test").with_prompt_cache_disabled();
 
@@ -600,6 +697,7 @@ mod tests {
             supports_streaming: true,
             name: LITELLM_PROVIDER_NAME.to_string(),
             cached_model_info: tokio::sync::Mutex::new(None),
+            oidc_auth: None,
         };
 
         assert_eq!(
@@ -631,6 +729,7 @@ mod tests {
             cached_model_info: tokio::sync::Mutex::new(Some(CachedModelInfo::Failure(
                 Instant::now() - MODEL_INFO_FAILURE_TTL,
             ))),
+            oidc_auth: None,
         };
 
         assert!(provider.get_or_fetch_models().await.is_err());
@@ -659,11 +758,221 @@ mod tests {
             supports_streaming: true,
             name: LITELLM_PROVIDER_NAME.to_string(),
             cached_model_info,
+            oidc_auth: None,
         };
 
         assert_eq!(
             provider.get_context_limit("cached-model", None).await,
             32_000
         );
+    }
+
+    #[tokio::test]
+    async fn oidc_jwt_auth_refreshes_on_401_and_retries_request() {
+        use super::super::litellm_oauth::{OidcFlowMode, OidcTokenType, TokenCache, TokenData};
+        use chrono::Utc;
+        use wiremock::matchers::header;
+
+        let idp_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "token_endpoint": format!("{}/token", idp_server.uri())
+            })))
+            .mount(&idp_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "refreshed-jwt-token",
+                "expires_in": 3600
+            })))
+            .mount(&idp_server)
+            .await;
+
+        let litellm_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(header("Authorization", "Bearer stale-jwt-token"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+                "error": {"message": "JWT expired"}
+            })))
+            .up_to_n_times(1)
+            .mount(&litellm_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(header("Authorization", "Bearer refreshed-jwt-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "chatcmpl-litellm-jwt",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "test-model",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "authenticated with refreshed JWT"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6}
+            })))
+            .mount(&litellm_server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let oidc_config = LiteLLMOidcConfig {
+            issuer_url: idp_server.uri(),
+            client_id: "test-client".to_string(),
+            client_secret: None,
+            scopes: vec!["openid".to_string(), "offline_access".to_string()],
+            audience: None,
+            flow: OidcFlowMode::Device,
+            redirect_url: "http://localhost".to_string(),
+            token_type: OidcTokenType::AccessToken,
+        };
+        let cache = TokenCache::with_base_dir(dir.path().to_path_buf(), &oidc_config);
+        cache
+            .save(&TokenData {
+                access_token: "stale-jwt-token".to_string(),
+                id_token: None,
+                refresh_token: Some("refresh-secret".to_string()),
+                expires_at: Some(Utc::now() + chrono::Duration::hours(1)),
+            })
+            .unwrap();
+
+        let oidc_provider = Arc::new(LiteLLMOidcAuthProvider::with_cache(
+            oidc_config,
+            cache,
+            None,
+        ));
+        let api_client = ApiClient::new_with_tls(
+            litellm_server.uri(),
+            AuthMethod::Custom(Box::new(SharedOidcAuthProvider(Arc::clone(&oidc_provider)))),
+            None,
+        )
+        .unwrap();
+
+        let provider = LiteLLMProvider {
+            api_client,
+            base_path: "v1/chat/completions".to_string(),
+            supports_streaming: false,
+            name: LITELLM_PROVIDER_NAME.to_string(),
+            cached_model_info: tokio::sync::Mutex::new(None),
+            oidc_auth: Some(oidc_provider),
+        };
+
+        let model = ModelConfig::new("litellm-jwt-test").with_prompt_cache_disabled();
+        let mut stream = provider
+            .stream(&model, "", &[], &[])
+            .await
+            .expect("LiteLLM should refresh JWT on 401 and succeed");
+        let (message, _) = stream.next().await.unwrap().unwrap();
+        let text = message
+            .unwrap()
+            .content
+            .into_iter()
+            .map(|c| c.to_string())
+            .collect::<String>();
+        assert_eq!(text, "authenticated with refreshed JWT");
+    }
+
+    #[tokio::test]
+    async fn fetch_models_info_retries_on_401_with_refreshed_oidc_jwt() {
+        use super::super::litellm_oauth::{OidcFlowMode, OidcTokenType, TokenCache, TokenData};
+        use chrono::Utc;
+        use wiremock::matchers::header;
+
+        let idp_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "token_endpoint": format!("{}/token", idp_server.uri())
+            })))
+            .mount(&idp_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "refreshed-model-info-jwt",
+                "expires_in": 3600
+            })))
+            .mount(&idp_server)
+            .await;
+
+        let litellm_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/model/info"))
+            .and(header("Authorization", "Bearer expired-model-info-jwt"))
+            .respond_with(ResponseTemplate::new(401))
+            .up_to_n_times(1)
+            .mount(&litellm_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/model/info"))
+            .and(header("Authorization", "Bearer refreshed-model-info-jwt"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{
+                    "model_name": "gpt-4o-via-litellm",
+                    "model_info": {
+                        "max_input_tokens": 128000,
+                        "input_cost_per_token": 0.0000025,
+                        "output_cost_per_token": 0.00001,
+                        "supports_prompt_caching": true
+                    }
+                }]
+            })))
+            .mount(&litellm_server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let oidc_config = LiteLLMOidcConfig {
+            issuer_url: idp_server.uri(),
+            client_id: "test-client".to_string(),
+            client_secret: None,
+            scopes: vec!["openid".to_string(), "offline_access".to_string()],
+            audience: None,
+            flow: OidcFlowMode::Device,
+            redirect_url: "http://localhost".to_string(),
+            token_type: OidcTokenType::AccessToken,
+        };
+        let cache = TokenCache::with_base_dir(dir.path().to_path_buf(), &oidc_config);
+        cache
+            .save(&TokenData {
+                access_token: "expired-model-info-jwt".to_string(),
+                id_token: None,
+                refresh_token: Some("refresh-secret".to_string()),
+                expires_at: Some(Utc::now() + chrono::Duration::hours(1)),
+            })
+            .unwrap();
+
+        let oidc_provider = Arc::new(LiteLLMOidcAuthProvider::with_cache(
+            oidc_config,
+            cache,
+            None,
+        ));
+        let api_client = ApiClient::new_with_tls(
+            litellm_server.uri(),
+            AuthMethod::Custom(Box::new(SharedOidcAuthProvider(Arc::clone(&oidc_provider)))),
+            None,
+        )
+        .unwrap();
+
+        let provider = LiteLLMProvider {
+            api_client,
+            base_path: "v1/chat/completions".to_string(),
+            supports_streaming: true,
+            name: LITELLM_PROVIDER_NAME.to_string(),
+            cached_model_info: tokio::sync::Mutex::new(None),
+            oidc_auth: Some(oidc_provider),
+        };
+
+        let models = provider
+            .fetch_supported_models()
+            .await
+            .expect("/model/info should succeed after 401 refresh");
+        assert_eq!(models, vec!["gpt-4o-via-litellm".to_string()]);
     }
 }
